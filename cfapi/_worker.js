@@ -103,13 +103,6 @@ async function getNextKeyIndex(db, service, keysCount) {
 
 // --- WORKER LOGIC (ES Modules format) ---
 export default {
-  /**
-   * The main entry point for the Worker.
-   * @param {Request} request The incoming request.
-   * @param {object} env Environment variables, including the LOGS binding.
-   * @param {object} ctx Execution context, used for ctx.waitUntil().
-   * @returns {Promise<Response>}
-   */
   async fetch(request, env, ctx) {
     const startTime = Date.now();
     let response;
@@ -118,54 +111,50 @@ export default {
     try {
       // Validate URL format
       const url = new URL(request.url);
-      
-      // Parse path segments
       const pathSegments = url.pathname.split('/').filter(Boolean);
       
-      // Check if there's a service provider segment and it's configured in ROUTE_MAP
       if (pathSegments.length < 1 || !ROUTE_MAP[pathSegments[0]]) {
-        // Invalid URL format, return error code 325 without logging
         return new Response('url格式错误', { status: 325 });
       }
 
-      // Extract service name (already validated to be lowercase)
       const service = pathSegments[0];
       
       // ==========================================
-      // 新增：拦截发往 Groq 的 POST 请求并过滤字段
+      // 拦截 1：处理 Groq 的 reasoning_content 报错
       // ==========================================
       if (service === 'groq' && request.method === 'POST') {
         request = await stripReasoningContent(request);
       }
-      // ==========================================
       
-      // Delay cloning request and parsing data until necessary
+      // ==========================================
+      // 拦截 2：处理 Gemini 的 MASTER_KEY 轮询
+      // ==========================================
+      if (service === 'gemini') {
+        request = handleGeminiRotation(request, env);
+      }
+      // ==========================================
+
       requestData = { service, model: 'unknown' };
       
-      // Attempt to extract model information without blocking main logic
+      // 提取 Model 信息（用于日志）
       try {
-        // Only attempt to extract model info if LOGS is configured and it's a POST request
         if (env.LOGS && request.method === 'POST') {
           if (service === 'gemini') {
-            // For Gemini POST requests, extract model from URL path
             if (pathSegments.length >= 4 && pathSegments[2] === 'models') {
               requestData.model = pathSegments[3].split(':')[0] || 'unknown';
             }
           } else {
-            // For other services' POST requests, extract model from request body
             const clonedRequest = request.clone();
             const body = await clonedRequest.json().catch(() => ({}));
             requestData.model = body.model || 'unknown';
           }
         }
-      } catch (e) {
-        // Ignore any data extraction errors and continue processing
-      }
+      } catch (e) {}
 
-      // Handle API rotation logic and pass parsed URL to avoid duplicate creation
+      // 调用你原有的路由和轮询逻辑（处理 OpenAI 等其他服务的轮询）
       response = await handleRequestWithRotation(request, service, env, url);
       
-      // Only clone response and log when LOGS binding is available
+      // 日志记录
       if (env.LOGS) {
         const clonedResponse = response.clone();
         ctx.waitUntil(logRequest(env, requestData, clonedResponse, startTime));
@@ -174,21 +163,18 @@ export default {
       return response;
 
     } catch (err) {
-      // For URL format errors, we already handled them separately earlier, here handle other errors
       response = new Response(err.message || 'An unexpected error occurred.', { status: 500 });
-      
-      // Only log error when LOGS binding is available
       if (env.LOGS) {
         ctx.waitUntil(logRequest(env, requestData, response, startTime, err));
       }
-
       return response;
     }
   }
 };
-/**
- * 辅助函数：读取请求体，删除 assistant 消息中的 reasoning_content 字段
- */
+
+// ==========================================
+// 辅助函数 1：剥离 Groq 的 reasoning_content
+// ==========================================
 async function stripReasoningContent(request) {
   const clonedRequest = request.clone();
   try {
@@ -196,6 +182,7 @@ async function stripReasoningContent(request) {
     if (body && Array.isArray(body.messages)) {
       let mutated = false;
       body.messages.forEach(msg => {
+        // 删除 assistant 消息中的 reasoning_content 字段
         if (msg.role === 'assistant' && 'reasoning_content' in msg) {
           delete msg.reasoning_content;
           mutated = true;
@@ -203,12 +190,8 @@ async function stripReasoningContent(request) {
       });
       
       if (mutated) {
-        // 创建一个新的 Headers，并移除旧的 content-length
-        // 因为过滤字段后，请求体长度变短了，如果不移除会导致 Groq 报错
         const newHeaders = new Headers(request.headers);
-        newHeaders.delete('content-length');
-
-        // 重建 Request 对象并返回
+        newHeaders.delete('content-length'); // 必须删除，因为 body 长度变了
         return new Request(request.url, {
           method: request.method,
           headers: newHeaders,
@@ -217,8 +200,54 @@ async function stripReasoningContent(request) {
       }
     }
   } catch (e) {
-    console.warn('Body is not JSON, skipping reasoning_content strip.');
+    console.warn('Groq body is not JSON, skipping reasoning_content strip.');
   }
+  return request;
+}
+
+// ==========================================
+// 辅助函数 2：处理 Gemini 的 MASTER_KEY 轮询
+// ==========================================
+function handleGeminiRotation(request, env) {
+  const url = new URL(request.url);
+  
+  const clientKey = url.searchParams.get('key');
+  const headerKey = request.headers.get('x-goog-api-key');
+
+  const isMasterKey = (clientKey === env.MASTER_KEY) || (headerKey === env.MASTER_KEY);
+
+  if (isMasterKey) {
+    let realKeys = [];
+    try {
+      if (env.GEMINI_KEYS) {
+        realKeys = JSON.parse(env.GEMINI_KEYS);
+      }
+    } catch (e) {
+      console.error('GEMINI_KEYS 格式错误，必须是 JSON 数组');
+      return request;
+    }
+
+    if (realKeys.length === 0) return request;
+
+    // 随机挑选一个真实 Key
+    const realKey = realKeys[Math.floor(Math.random() * realKeys.length)];
+
+    if (clientKey === env.MASTER_KEY) {
+      url.searchParams.set('key', realKey);
+      return new Request(url.toString(), request);
+    }
+
+    if (headerKey === env.MASTER_KEY) {
+      const newHeaders = new Headers(request.headers);
+      newHeaders.set('x-goog-api-key', realKey);
+      return new Request(request.url, {
+        method: request.method,
+        headers: newHeaders,
+        body: request.body
+      });
+    }
+  }
+
   return request;
 }
 
