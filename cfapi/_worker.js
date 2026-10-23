@@ -131,6 +131,14 @@ export default {
       // Extract service name (already validated to be lowercase)
       const service = pathSegments[0];
       
+      // ==========================================
+      // 新增：拦截发往 Groq 的 POST 请求并过滤字段
+      // ==========================================
+      if (service === 'groq' && request.method === 'POST') {
+        request = await stripReasoningContent(request);
+      }
+      // ==========================================
+      
       // Delay cloning request and parsing data until necessary
       requestData = { service, model: 'unknown' };
       
@@ -140,9 +148,7 @@ export default {
         if (env.LOGS && request.method === 'POST') {
           if (service === 'gemini') {
             // For Gemini POST requests, extract model from URL path
-            // Expected format: https://{custom-url}/gemini/v1beta/models/{model-name}:{function-name}
             if (pathSegments.length >= 4 && pathSegments[2] === 'models') {
-              // Split by colon to get model name without function suffix
               requestData.model = pathSegments[3].split(':')[0] || 'unknown';
             }
           } else {
@@ -180,6 +186,41 @@ export default {
     }
   }
 };
+/**
+ * 辅助函数：读取请求体，删除 assistant 消息中的 reasoning_content 字段
+ */
+async function stripReasoningContent(request) {
+  const clonedRequest = request.clone();
+  try {
+    const body = await clonedRequest.json();
+    if (body && Array.isArray(body.messages)) {
+      let mutated = false;
+      body.messages.forEach(msg => {
+        if (msg.role === 'assistant' && 'reasoning_content' in msg) {
+          delete msg.reasoning_content;
+          mutated = true;
+        }
+      });
+      
+      if (mutated) {
+        // 创建一个新的 Headers，并移除旧的 content-length
+        // 因为过滤字段后，请求体长度变短了，如果不移除会导致 Groq 报错
+        const newHeaders = new Headers(request.headers);
+        newHeaders.delete('content-length');
+
+        // 重建 Request 对象并返回
+        return new Request(request.url, {
+          method: request.method,
+          headers: newHeaders,
+          body: JSON.stringify(body),
+        });
+      }
+    }
+  } catch (e) {
+    console.warn('Body is not JSON, skipping reasoning_content strip.');
+  }
+  return request;
+}
 
 // --- CORE HANDLER ---
 /**
