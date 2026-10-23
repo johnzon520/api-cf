@@ -26,3 +26,6 @@ database_id = "7104e4d5-b93d-489d-b7ca-325bcd1bf05c" # <--- 粘贴您复制的�
 [[analytics_engine_datasets]]
 binding = "LOGS"                # 这是您代码中 `env.LOGS` 的名字，必须与要求一致
 dataset = "ai_gateway_logs"     # 数据集的名称，可自定义
+
+[placement]
+region = "gcp:us-central1"
