@@ -211,10 +211,16 @@ async function stripReasoningContent(request) {
 function handleGeminiRotation(request, env) {
   const url = new URL(request.url);
   
-  const clientKey = url.searchParams.get('key');
-  const headerKey = request.headers.get('x-goog-api-key');
+  // 1. 检查所有可能存放 Key 的地方
+  const clientKeyURL = url.searchParams.get('key');
+  const clientKeyHeader = request.headers.get('x-goog-api-key');
+  const authHeader = request.headers.get('Authorization');
+  const clientKeyAuth = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
 
-  const isMasterKey = (clientKey === env.MASTER_KEY) || (headerKey === env.MASTER_KEY);
+  // 2. 判断是否使用了 MASTER_KEY
+  const isMasterKey = (clientKeyURL === env.MASTER_KEY) || 
+                      (clientKeyHeader === env.MASTER_KEY) || 
+                      (clientKeyAuth === env.MASTER_KEY);
 
   if (isMasterKey) {
     let realKeys = [];
@@ -229,17 +235,28 @@ function handleGeminiRotation(request, env) {
 
     if (realKeys.length === 0) return request;
 
-    // 随机挑选一个真实 Key
+    // 3. 随机选取一个真实 Key
     const realKey = realKeys[Math.floor(Math.random() * realKeys.length)];
 
-    if (clientKey === env.MASTER_KEY) {
+    // 4. 根据原来传参的位置，替换成真实 Key 并返回
+    if (clientKeyURL === env.MASTER_KEY) {
       url.searchParams.set('key', realKey);
       return new Request(url.toString(), request);
     }
 
-    if (headerKey === env.MASTER_KEY) {
+    if (clientKeyHeader === env.MASTER_KEY) {
       const newHeaders = new Headers(request.headers);
       newHeaders.set('x-goog-api-key', realKey);
+      return new Request(request.url, {
+        method: request.method,
+        headers: newHeaders,
+        body: request.body
+      });
+    }
+
+    if (clientKeyAuth === env.MASTER_KEY) {
+      const newHeaders = new Headers(request.headers);
+      newHeaders.set('Authorization', `Bearer ${realKey}`);
       return new Request(request.url, {
         method: request.method,
         headers: newHeaders,
